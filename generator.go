@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -17,7 +18,7 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/gedex/inflector"
-	"github.com/idubinskiy/schematyper/stringset"
+	"github.com/sportlinkservices/schematyper/stringset"
 )
 
 //go:generate schematyper --root-type=metaSchema --prefix=meta metaschema.json
@@ -28,6 +29,7 @@ var (
 	packageName     = kingpin.Flag("package", `package name for generated file; default is "main"`).Default("main").String()
 	rootTypeName    = kingpin.Flag("root-type", `name of root type; default is generated from the filename`).String()
 	typeNamesPrefix = kingpin.Flag("prefix", `prefix for non-root types`).String()
+	expand          = kingpin.Flag("expand", "expand OneOf sub schemas prior to generating code").Bool()
 	ptrForOmit      = kingpin.Flag("ptr-for-omit", "use a pointer to a struct for an object property that is represented as a struct if the property is not required (i.e., has omitempty tag)").Default("false").Bool()
 	inputFile       = kingpin.Arg("input", "file containing a valid JSON schema").Required().ExistingFile()
 )
@@ -702,7 +704,33 @@ func parseDefs(s *metaSchema, path string) {
 	}
 }
 
+func ExpandSchema(rootDir string, rootSchema *metaSchema) {
+	if rootSchema.Definitions == nil {
+		rootSchema.Definitions = make(map[string]metaSchema)
+	}
+	oneOf := metaSchemaArray{}
+	for _, subSchema := range rootSchema.OneOf {
+		if subSchema.Ref == "" {
+			continue
+		}
+		data, err := ioutil.ReadFile(path.Join(rootDir, subSchema.Ref))
+		if err != nil {
+			fmt.Println("Skipping sub schema ref:", subSchema.Ref)
+			continue
+		}
+		schema := metaSchema{}
+		err = json.Unmarshal(data, &schema)
+		if err != nil { panic(err) }
+		rootSchema.Definitions[schema.Title] = schema
+		oneOf = append(oneOf, metaSchema{
+			Ref: "#/definitions/" + schema.Title,
+		})
+	}
+	rootSchema.OneOf = oneOf
+}
+
 func main() {
+	fmt.Println("Schematyper 0.1.1")
 	kingpin.Parse()
 
 	file, err := ioutil.ReadFile(*inputFile)
@@ -713,6 +741,10 @@ func main() {
 	var s metaSchema
 	if err = json.Unmarshal(file, &s); err != nil {
 		log.Fatalln("Error parsing JSON:", err)
+	}
+
+	if *expand {
+		ExpandSchema(path.Dir(*inputFile), &s)
 	}
 
 	schemaName := strings.Split(filepath.Base(*inputFile), ".")[0]
@@ -737,9 +769,18 @@ func main() {
 	}
 	sort.Stable(typesSlice)
 	for _, gt := range typesSlice {
+		if len(gt.Fields) < 1 {
+			continue
+		}
 		gt.print(&resultSrc)
 		resultSrc.WriteString("\n")
 	}
+	resultSrc.WriteString("var Constructors = map[string]func() interface{} {\n")
+	for _, gt := range typesSlice {
+		if gt.TypePrefix == "interface{}" { continue }
+		resultSrc.WriteString(fmt.Sprintf("\"%s\": func() interface{} { return &%s{} },\n", gt.origTypeName, gt.Name))
+	}
+	resultSrc.WriteString("}\n")
 	formattedSrc, err := format.Source(resultSrc.Bytes())
 	if err != nil {
 		fmt.Println(resultSrc.String())
